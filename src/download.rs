@@ -87,8 +87,16 @@ impl Downloader {
             .unwrap();
         let mut download_names = Vec::new();
         let mut handles = Vec::new();
-        for (chap_num, img_urls) in task.page_urls.iter().enumerate() {
-            for (page_num, img_path) in img_urls.iter().enumerate() {
+        let save_dir: Arc<Path> = Arc::from(save_dir);
+        let DownloadTask {
+            book_real_id: _,
+            botu_read_kernel,
+            page_urls,
+        } = task;
+        let botu_read_kernel: Arc<str> = Arc::from(botu_read_kernel.as_str());
+
+        for (chap_num, img_urls) in page_urls.into_iter().enumerate() {
+            for (page_num, img_path) in img_urls.into_iter().enumerate() {
                 let filename = format!(
                     "{}_{}.{}",
                     chap_num,
@@ -107,9 +115,8 @@ impl Downloader {
                     continue;
                 }
                 download_names.push(filename.clone());
-                let botu_read_kernel = task.botu_read_kernel.clone();
-                let img_path = img_path.clone();
-                let save_dir = save_dir.to_path_buf();
+                let botu_read_kernel = botu_read_kernel.clone();
+                let save_dir = save_dir.to_owned();
                 let self_clone = self.clone();
                 let cancel = cancel.clone();
                 let handle = runtime.spawn(async move {
