@@ -3,13 +3,9 @@ use lopdf::content::Content;
 use lopdf::{Document, Object, SaveOptions, Stream, dictionary};
 
 use std::collections::HashMap;
-use std::{
-    cmp::Ordering,
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{cmp::Ordering, fs, path::Path, sync::Arc};
 
-fn get_images(dir: &Path) -> Vec<PathBuf> {
+fn get_images(dir: &Path) -> Vec<Arc<Path>> {
     let mut result = Vec::new();
     for entry in
         fs::read_dir(dir).unwrap_or_else(|_| panic!("Can't open directory {}", dir.display()))
@@ -52,13 +48,16 @@ fn get_images(dir: &Path) -> Vec<PathBuf> {
             _ => order,
         }
     });
-    result.iter().map(|filename| dir.join(filename)).collect()
+    result
+        .iter()
+        .map(|filename| Arc::from(dir.join(filename)))
+        .collect()
 }
 
 async fn pre_process_imgs(
-    imgs: &Vec<PathBuf>,
+    imgs: &Vec<Arc<Path>>,
     intermediate_dir: &Path,
-    quality: i32,
+    quality: u32,
     auto_resize: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let total = imgs.len();
@@ -89,9 +88,10 @@ async fn pre_process_imgs(
     if let Some((width, height)) = common_size {
         println!("Auto resizing with width: {width}, height: {height}");
     }
+    let intermediate_dir: Arc<Path> = Arc::from(intermediate_dir);
     for img_path in imgs {
         let img_path_clone = img_path.clone();
-        let intermediate_dir_clone = intermediate_dir.to_path_buf();
+        let intermediate_dir_clone = intermediate_dir.clone();
         let handle = tokio::task::spawn_blocking(move || {
             let file_name = img_path_clone.file_name().unwrap();
             let output_path = intermediate_dir_clone.join(file_name);
@@ -107,12 +107,11 @@ async fn pre_process_imgs(
             };
 
             let img = img.resize(
-                width / 10 * quality as u32,
-                height / 10 * quality as u32,
+                width / 10 * quality,
+                height / 10 * quality,
                 image::imageops::FilterType::Lanczos3,
             );
 
-            let output_path = intermediate_dir_clone.join(file_name);
             img.save(&output_path)?;
             println!("Resize complete: {}", file_name.display());
             Ok(())
@@ -126,9 +125,9 @@ async fn pre_process_imgs(
 }
 
 async fn img2pdf(
-    imgs: Vec<PathBuf>,
+    imgs: Vec<Arc<Path>>,
     pdf_path: &Path,
-    quality: i32,
+    quality: u32,
     auto_resize: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let intermediate_dir = pdf_path.parent().unwrap().join("intermediate");
@@ -200,7 +199,7 @@ async fn img2pdf(
 pub async fn convert(
     dir: &Path,
     pdf_path: &Path,
-    quality: i32,
+    quality: u32,
     auto_resize: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let imgs = get_images(dir);
