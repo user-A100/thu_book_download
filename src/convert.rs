@@ -61,10 +61,6 @@ async fn pre_process_imgs(
     quality: i32,
     auto_resize: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
     let total = imgs.len();
     let mut handles: Vec<
         tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
@@ -96,7 +92,7 @@ async fn pre_process_imgs(
     for img_path in imgs {
         let img_path_clone = img_path.clone();
         let intermediate_dir_clone = intermediate_dir.to_path_buf();
-        let handle = runtime.spawn_blocking(move || {
+        let handle = tokio::task::spawn_blocking(move || {
             let file_name = img_path_clone.file_name().unwrap();
             let output_path = intermediate_dir_clone.join(file_name);
             if output_path.exists() {
@@ -126,7 +122,6 @@ async fn pre_process_imgs(
     for handle in handles {
         let _ = handle.await;
     }
-    runtime.shutdown_background();
     Ok(())
 }
 
