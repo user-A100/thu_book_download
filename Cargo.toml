@@ -4,6 +4,7 @@ version = "1.0.2"
 edition = "2024"
 
 [dependencies]
+axum = "0.8.4"
 clap = { version = "4.5.47", features = ["cargo"] }
 image = "0.25.8"
 lopdf = { version = "0.38.0", features = [
@@ -24,6 +25,7 @@ tokio = { version = "1.47.1", features = [
     "signal",
 ] }
 tokio-util = "0.7.16"
+tower-http = { version = "0.6.6", features = ["cors"] }
 
 [profile.release]
 lto = true

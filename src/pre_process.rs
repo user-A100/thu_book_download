@@ -60,7 +60,7 @@ impl Preprocessor {
         let v: Value = serde_json::from_str(&res)?;
         let book_real_id = v["data"]["jc_ebook_vo"]["urls"][0]["READURL"]
             .as_str()
-            .unwrap()
+            .ok_or_else(|| std::io::Error::other("无法读取书籍信息，请确认登录 token 有效"))?
             .to_owned();
 
         let res = self
@@ -73,34 +73,40 @@ impl Preprocessor {
             .text()
             .await?;
         let v: Value = serde_json::from_str(&res)?;
-        if v["info"].as_str().unwrap() != "成功" {
-            println!("{}", v);
-            panic!("Token error, please retry");
+        if v["info"].as_str() != Some("成功") {
+            return Err(std::io::Error::other("登录 token 已失效，请重新登录教参平台").into());
         }
-        let book_access_url = v["data"].as_str().unwrap();
+        let book_access_url = v["data"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::other("平台未返回书籍访问地址"))?;
 
         let res = self.client_no_redirect.get(book_access_url).send().await?;
         let botu_read_kernel = res
             .cookies()
             .find(|cookie| cookie.name() == "BotuReadKernel")
-            .unwrap()
+            .ok_or_else(|| std::io::Error::other("平台未返回阅读会话 Cookie"))?
             .value()
             .to_owned();
 
         let res = self
             .client
-            .get(res.headers().get("Location").unwrap().to_str()?)
+            .get(
+                res.headers()
+                    .get("Location")
+                    .ok_or_else(|| std::io::Error::other("平台未返回阅读页面地址"))?
+                    .to_str()?,
+            )
             .send()
             .await?;
         let doc = Html::parse_document(res.text().await?.as_str());
         let selector = Selector::parse("#scanid").unwrap();
         let scan_id = doc
             .select(&selector)
-            .nth(0)
-            .unwrap()
+            .next()
+            .ok_or_else(|| std::io::Error::other("阅读页面缺少 scanid"))?
             .value()
             .attr("value")
-            .unwrap()
+            .ok_or_else(|| std::io::Error::other("阅读页面的 scanid 无效"))?
             .to_owned();
 
         Ok((botu_read_kernel, book_real_id, scan_id))
@@ -124,12 +130,19 @@ impl Preprocessor {
             .text()
             .await?;
         let v: Value = serde_json::from_str(res.as_str())?;
-        let info_array = v["data"].as_array().unwrap();
-        let emids: Vec<String> = info_array
+        let info_array = v["data"]
+            .as_array()
+            .ok_or_else(|| std::io::Error::other("平台未返回书籍章节"))?;
+        let emids: Result<Vec<String>, std::io::Error> = info_array
             .iter()
-            .map(|info| info["EMID"].as_str().unwrap().to_owned())
+            .map(|info| {
+                info["EMID"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| std::io::Error::other("章节编号无效"))
+            })
             .collect();
-        Ok(emids)
+        Ok(emids?)
     }
 
     async fn get_book_pages(
@@ -153,14 +166,20 @@ impl Preprocessor {
                 .await?
                 .text()
                 .await?;
-            let v: Value = serde_json::from_str(res.as_str()).unwrap();
-            let info_array = v["data"]["JGPS"].as_array().unwrap();
-            page_urls.push(
-                info_array
-                    .iter()
-                    .map(|info| info["hfsKey"].as_str().unwrap().to_owned())
-                    .collect(),
-            );
+            let v: Value = serde_json::from_str(res.as_str())?;
+            let info_array = v["data"]["JGPS"]
+                .as_array()
+                .ok_or_else(|| std::io::Error::other("平台未返回章节页面"))?;
+            let pages: Result<Vec<String>, std::io::Error> = info_array
+                .iter()
+                .map(|info| {
+                    info["hfsKey"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| std::io::Error::other("书籍页面地址无效"))
+                })
+                .collect();
+            page_urls.push(pages?);
         }
 
         Ok(page_urls)

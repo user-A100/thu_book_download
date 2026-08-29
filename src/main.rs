@@ -1,72 +1,82 @@
-use std::fs;
-
 use clap::{Arg, ArgAction, command, value_parser};
 use tokio_util::sync::CancellationToken;
 
+mod app;
 mod convert;
 mod download;
 mod pre_process;
+mod server;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let matches = command!().version(env!("CARGO_PKG_VERSION")).author("Ricky1911").about(
-        "Download e-book from http://ereserves.lib.tsinghua.edu.cn. By default, the number of threads is four and the temporary images WILL BE preserved.
-        For example, \"thubookrs https://ereserves.lib.tsinghua.edu.cn/bookDetail/c01e1db11c4041a39db463e810bac8f94af518935a1ec46ef --token eyJhb...\".
-        Note that you need to manually login the ereserves website and obtain the token from the FIRST request after login,
-        like \"/index?token=xxx\", due to two-factor authentication (2FA)."
-    )
-    .arg(Arg::new("url").required(true).value_parser(value_parser!(String)))
-    .arg(Arg::new("token").required(true).short('t').long("token").help("Required. The token from the \"/index?token=xxx\".").value_parser(value_parser!(String)))
-    .arg(Arg::new("thread_number").required(false).short('n').help("Optional. The number of threads. [1~16]").value_parser(value_parser!(u8).range(1..17)).default_value("4"))
-    .arg(Arg::new("quality").required(false).short('q').help("Optional. The quality of the generated PDF. The bigger the value, the higher the resolution. [3~10]").value_parser(value_parser!(u8).range(3..11)).default_value("10"))
-    .arg(Arg::new("del_img").required(false).short('d').long("del-img").help("Optional. Delete the temporary images.").action(ArgAction::SetTrue))
-    .arg(Arg::new("auto_resize").required(false).short('r').long("auto-resize").help("Optional. Automatically unify page sizes.").action(ArgAction::SetTrue))
-    .get_matches();
-    let url = matches.get_one::<String>("url").unwrap();
-    let token = matches.get_one::<String>("token").unwrap();
-    let thread_number = matches.get_one::<u8>("thread_number").unwrap();
-    let quality = matches.get_one::<u8>("quality").unwrap();
-    let del_img = matches.get_one::<bool>("del_img").unwrap();
-    let auto_resize = matches.get_one::<bool>("auto_resize").unwrap();
+    if std::env::args().nth(1).as_deref() == Some("serve") || std::env::args().len() == 1 {
+        return server::serve().await;
+    }
 
-    let download_start = std::time::Instant::now();
-    let pre_processor = pre_process::Preprocessor::new()?;
-    let task = pre_processor.parse(url, token).await?;
-    let downloader = download::Downloader::new()?;
+    let matches = command!()
+        .version(env!("CARGO_PKG_VERSION"))
+        .author("Ricky1911")
+        .about("下载清华教参平台电子书。无参数运行时启动浏览器服务。")
+        .arg(
+            Arg::new("url")
+                .required(true)
+                .value_parser(value_parser!(String)),
+        )
+        .arg(
+            Arg::new("token")
+                .required(true)
+                .short('t')
+                .long("token")
+                .value_parser(value_parser!(String)),
+        )
+        .arg(
+            Arg::new("thread_number")
+                .short('n')
+                .value_parser(value_parser!(u8).range(1..17))
+                .default_value("4"),
+        )
+        .arg(
+            Arg::new("quality")
+                .short('q')
+                .value_parser(value_parser!(u8).range(3..11))
+                .default_value("10"),
+        )
+        .arg(
+            Arg::new("del_img")
+                .short('d')
+                .long("del-img")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("auto_resize")
+                .short('r')
+                .long("auto-resize")
+                .action(ArgAction::SetTrue),
+        )
+        .get_matches();
+
     let cancel = CancellationToken::new();
-    let save_dir = std::env::current_dir()?
-        .join("downloads")
-        .join(&task.book_real_id);
-    let success = tokio::select! {
+    let options = app::DownloadOptions {
+        url: matches.get_one::<String>("url").unwrap().clone(),
+        token: matches.get_one::<String>("token").unwrap().clone(),
+        thread_number: *matches.get_one::<u8>("thread_number").unwrap() as usize,
+        quality: *matches.get_one::<u8>("quality").unwrap() as u32,
+        del_img: *matches.get_one::<bool>("del_img").unwrap(),
+        auto_resize: *matches.get_one::<bool>("auto_resize").unwrap(),
+        output_root: std::env::current_dir()?.join("downloads"),
+    };
+    let result = tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             cancel.cancel();
-            false
+            Err("任务已取消".to_string())
         },
-        result = downloader.download_imgs(task, &save_dir, *thread_number as usize, cancel.clone()) => { result }
+        result = app::run_download(options, cancel.clone(), None, None, None) => result,
     };
-    if !success {
-        return Err(Box::new(std::io::Error::other("failed")).into());
+    match result {
+        Ok(path) => {
+            println!("PDF 已生成：{}", path.display());
+            Ok(())
+        }
+        Err(error) => Err(std::io::Error::other(error).into()),
     }
-
-    println!(
-        "Download complete in {}s",
-        download_start.elapsed().as_secs_f32()
-    );
-
-    let convert_start = std::time::Instant::now();
-    convert::convert(
-        &save_dir,
-        &save_dir.with_extension("pdf"),
-        *quality as u32,
-        *auto_resize,
-    )
-    .await?;
-    println!(
-        "Convert complete in {}s",
-        convert_start.elapsed().as_secs_f32()
-    );
-    if *del_img {
-        fs::remove_dir_all(&save_dir)?;
-    }
-    Ok(())
 }

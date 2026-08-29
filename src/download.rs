@@ -3,6 +3,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::Arc,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use rand::Rng;
@@ -76,6 +77,7 @@ impl Downloader {
         save_dir: &Path,
         thread_num: usize,
         cancel: tokio_util::sync::CancellationToken,
+        progress: Option<Arc<AtomicUsize>>,
     ) -> bool {
         if !save_dir.exists() {
             fs::create_dir_all(save_dir).unwrap();
@@ -112,6 +114,9 @@ impl Downloader {
                 let path = save_dir.join(&filename);
                 if path.exists() {
                     println!("Already downloaded: {}, skip", &filename);
+                    if let Some(progress) = &progress {
+                        progress.fetch_add(1, Ordering::Relaxed);
+                    }
                     continue;
                 }
                 download_names.push(filename.clone());
@@ -119,13 +124,18 @@ impl Downloader {
                 let save_dir = save_dir.to_owned();
                 let self_clone = self.clone();
                 let cancel = cancel.clone();
+                let progress = progress.clone();
                 let handle = runtime.spawn(async move {
-                    tokio::select! {
+                    let result = tokio::select! {
                         result = self_clone
                         .download_one(&botu_read_kernel, &img_path, &save_dir, &filename)
                         => { result }
                         _ = cancel.cancelled() => { Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "Keyboard interrupted").into()) }
+                    };
+                    if result.is_ok() && let Some(progress) = progress {
+                        progress.fetch_add(1, Ordering::Relaxed);
                     }
+                    result
                 });
                 handles.push(handle);
             }
