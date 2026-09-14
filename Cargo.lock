@@ -2731,7 +2731,7 @@ dependencies = [
 
 [[package]]
 name = "thubookrs"
-version = "1.0.2"
+version = "1.2.0"
 dependencies = [
  "axum",
  "clap",

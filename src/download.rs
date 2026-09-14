@@ -4,13 +4,19 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
     sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
 };
 
 use rand::Rng;
 use reqwest::{Client, ClientBuilder, header};
 use reqwest_cookie_store::{CookieStore, CookieStoreMutex};
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 use crate::pre_process::DownloadTask;
+
+const MAX_ATTEMPTS: usize = 3;
+const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
 fn get_tmp_name() -> PathBuf {
     let rand_string: String = rand::rng()
@@ -21,10 +27,13 @@ fn get_tmp_name() -> PathBuf {
     PathBuf::from(format!(".tmp{}", rand_string))
 }
 
+fn interrupted_error() -> Box<dyn std::error::Error + Send + Sync> {
+    std::io::Error::new(std::io::ErrorKind::Interrupted, "Keyboard interrupted").into()
+}
+
 #[derive(Clone)]
 pub struct Downloader {
     client: Client,
-    //cookie_store: Arc<CookieStoreMutex>,
 }
 
 impl Downloader {
@@ -36,9 +45,50 @@ impl Downloader {
             client: ClientBuilder::new()
                 .default_headers(default_headers)
                 .cookie_provider(Arc::clone(&cookie_store))
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(120))
                 .build()?,
-            //cookie_store,
         })
+    }
+
+    async fn download_once(
+        &self,
+        botu_read_kernel: &str,
+        img_path: &str,
+        save_dir: &Path,
+        filename: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = "https://ereserves.lib.tsinghua.edu.cn/readkernel/JPGFile/DownJPGJsNetPage";
+        println!("Start Downloading: {}", &filename);
+        let res = self
+            .client
+            .get(url)
+            .query(&[("filePath", img_path)])
+            .header("Cookie", format!("BotuReadKernel={}", botu_read_kernel))
+            .send()
+            .await?
+            .error_for_status()?;
+        let bytes = res.bytes().await?;
+        let save_path = save_dir.join(filename);
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let tmp_name = loop {
+                let tmp_name = get_tmp_name();
+                if !tmp_name.exists() {
+                    break tmp_name;
+                }
+            };
+            let mut file = fs::File::create(&tmp_name)?;
+            file.write_all(&bytes)?;
+            drop(file);
+            let result = fs::rename(&tmp_name, &save_path);
+            if result.is_err() {
+                let _ = fs::remove_file(&tmp_name);
+            }
+            result
+        })
+        .await??;
+        println!("Download success: {}", filename);
+        Ok(())
     }
 
     async fn download_one(
@@ -47,28 +97,35 @@ impl Downloader {
         img_path: &str,
         save_dir: &Path,
         filename: &str,
+        cancel: &CancellationToken,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let url = "https://ereserves.lib.tsinghua.edu.cn/readkernel/JPGFile/DownJPGJsNetPage";
-        let save_path = save_dir.join(filename);
-        let res = self
-            .client
-            .get(url)
-            .query(&[("filePath", img_path)])
-            .header("Cookie", format!("BotuReadKernel={}", botu_read_kernel))
-            .send();
-        println!("Start Downloading: {}", &filename);
-        let tmp_name = loop {
-            let tmp_name = get_tmp_name();
-            if !tmp_name.exists() {
-                break tmp_name;
+        let mut backoff = INITIAL_BACKOFF;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let result = tokio::select! {
+                result = self.download_once(botu_read_kernel, img_path, save_dir, filename) => result,
+                _ = cancel.cancelled() => return Err(interrupted_error()),
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt < MAX_ATTEMPTS => {
+                    println!(
+                        "Download failed: {} ({}), retrying in {:?} ({}/{})",
+                        filename,
+                        e,
+                        backoff,
+                        attempt,
+                        MAX_ATTEMPTS - 1
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        _ = cancel.cancelled() => return Err(interrupted_error()),
+                    }
+                    backoff *= 2;
+                }
+                Err(e) => return Err(format!("下载 {} 失败: {}", filename, e).into()),
             }
-        };
-        let bytes = res.await?.bytes().await?;
-        let mut file = fs::File::create(&tmp_name)?;
-        file.write_all(&bytes)?;
-        fs::rename(tmp_name, save_path)?;
-        println!("Download success: {}", filename);
-        Ok(())
+        }
+        unreachable!()
     }
 
     pub async fn download_imgs(
@@ -76,18 +133,13 @@ impl Downloader {
         task: DownloadTask,
         save_dir: &Path,
         thread_num: usize,
-        cancel: tokio_util::sync::CancellationToken,
+        cancel: CancellationToken,
         progress: Option<Arc<AtomicUsize>>,
     ) -> bool {
         if !save_dir.exists() {
             fs::create_dir_all(save_dir).unwrap();
         }
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(thread_num)
-            .enable_all()
-            .build()
-            .unwrap();
-        let mut download_names = Vec::new();
+        let semaphore = Arc::new(Semaphore::new(thread_num.max(1)));
         let mut handles = Vec::new();
         let save_dir: Arc<Path> = Arc::from(save_dir);
         let DownloadTask {
@@ -119,19 +171,17 @@ impl Downloader {
                     }
                     continue;
                 }
-                download_names.push(filename.clone());
                 let botu_read_kernel = botu_read_kernel.clone();
                 let save_dir = save_dir.to_owned();
                 let self_clone = self.clone();
                 let cancel = cancel.clone();
                 let progress = progress.clone();
-                let handle = runtime.spawn(async move {
-                    let result = tokio::select! {
-                        result = self_clone
-                        .download_one(&botu_read_kernel, &img_path, &save_dir, &filename)
-                        => { result }
-                        _ = cancel.cancelled() => { Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "Keyboard interrupted").into()) }
-                    };
+                let semaphore = semaphore.clone();
+                let handle = tokio::spawn(async move {
+                    let _permit = semaphore.acquire_owned().await.expect("semaphore closed");
+                    let result = self_clone
+                        .download_one(&botu_read_kernel, &img_path, &save_dir, &filename, &cancel)
+                        .await;
                     if result.is_ok() && let Some(progress) = progress {
                         progress.fetch_add(1, Ordering::Relaxed);
                     }
@@ -151,7 +201,6 @@ impl Downloader {
                 success = false;
             }
         }
-        runtime.shutdown_background();
         success
     }
 }
